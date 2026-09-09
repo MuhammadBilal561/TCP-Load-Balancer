@@ -3,17 +3,24 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 )
 
 func main() {
-	listener, err := net.Listen("tcp", ":8080")
+	port := "9001"
+
+	if len(os.Args) > 1 {
+		port = os.Args[1]
+	}
+
+	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		fmt.Println("Error starting server:", err)
+		fmt.Println("Error starting backend:", err)
 		return
 	}
 	defer listener.Close()
 
-	fmt.Println("TCP server listening on port 8080")
+	fmt.Println("Backend server listening on port", port)
 
 	for {
 		conn, err := listener.Accept()
@@ -33,9 +40,9 @@ func main() {
 			continue
 		}
 
-		fmt.Println("Received:", string(buffer[:n]))
+		fmt.Println("Backend", port, "received:", string(buffer[:n]))
 
-		response := []byte("Hello from Go server")
+		response := []byte("Hello from BACKEND " + port)
 
 		_, err = conn.Write(response)
 		if err != nil {
