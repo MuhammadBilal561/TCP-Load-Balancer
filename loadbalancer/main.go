@@ -3,19 +3,26 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"os"
 	"os/signal"
 	"strings"
 	"sync"
-	"syscall"
+	"sync/atomic"
 	"time"
 )
 
 type Backend struct {
 	Address string
 	Healthy bool
+}
+
+type copyResult struct {
+	direction string
+	bytes     int64
+	err       error
 }
 
 var (
@@ -25,16 +32,34 @@ var (
 	// Protects backend state.
 	mu sync.Mutex
 
-	// Tracks active proxy connections.
-	proxyWG sync.WaitGroup
-
-	// Protects activeConnections.
+	// Tracks active TCP connections.
 	connMu sync.Mutex
 
 	activeConnections = make(map[net.Conn]struct{})
+
+	// Connection statistics.
+	nextConnectionID atomic.Uint64
+	totalConnections  atomic.Uint64
+	activeProxies     atomic.Int64
+
+	// Structured logger.
+	logger *slog.Logger
 )
 
 func main() {
+	// ---------------------------------------------------------
+	// Logger
+	// ---------------------------------------------------------
+
+	logger = slog.New(
+		slog.NewTextHandler(
+			os.Stdout,
+			&slog.HandlerOptions{
+				Level: slog.LevelInfo,
+			},
+		),
+	)
+
 	// ---------------------------------------------------------
 	// Configuration
 	// ---------------------------------------------------------
@@ -56,7 +81,7 @@ func main() {
 	backends = parseBackends(*backendList)
 
 	if len(backends) == 0 {
-		fmt.Println("Error: at least one backend is required")
+		logger.Error("no backends configured")
 		return
 	}
 
@@ -66,7 +91,7 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(
 		context.Background(),
-		osInterrupt(),
+		os.Interrupt,
 	)
 
 	defer stop()
@@ -77,16 +102,30 @@ func main() {
 
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
-		fmt.Println("Error starting load balancer:", err)
+		logger.Error(
+			"failed to start listener",
+			"address", *listenAddr,
+			"error", err,
+		)
+
 		return
 	}
 
-	fmt.Println("Load balancer listening on", *listenAddr)
+	logger.Info(
+		"load balancer started",
+		"listen", *listenAddr,
+	)
 
-	fmt.Println("Configured backends:")
+	logger.Info(
+		"backends configured",
+		"count", len(backends),
+	)
 
 	for _, backend := range backends {
-		fmt.Println(" -", backend.Address)
+		logger.Info(
+			"backend configured",
+			"address", backend.Address,
+		)
 	}
 
 	// ---------------------------------------------------------
@@ -112,24 +151,58 @@ acceptLoop:
 		clientConn, err := listener.Accept()
 
 		if err != nil {
-			// Listener was closed because shutdown started.
 			if ctx.Err() != nil {
 				break acceptLoop
 			}
 
-			fmt.Println("Error accepting client:", err)
+			logger.Error(
+				"failed to accept client",
+				"error", err,
+			)
+
 			continue
 		}
+
+		// Give this connection a unique ID.
+		connectionID := nextConnectionID.Add(1)
+
+		totalConnections.Add(1)
+		activeProxies.Add(1)
+
+		logger.Info(
+			"client connected",
+			"connection_id", connectionID,
+			"remote", clientConn.RemoteAddr().String(),
+			"active_connections", activeProxies.Load(),
+		)
+
+		// -----------------------------------------------------
+		// Select backend
+		// -----------------------------------------------------
 
 		backend, ok := getNextHealthyBackend()
 
 		if !ok {
-			fmt.Println("No healthy backends available")
+			logger.Error(
+				"no healthy backends available",
+				"connection_id", connectionID,
+			)
+
 			clientConn.Close()
+			activeProxies.Add(-1)
+
 			continue
 		}
 
-		fmt.Println("Routing client to:", backend)
+		logger.Info(
+			"client routed",
+			"connection_id", connectionID,
+			"backend", backend,
+		)
+
+		// -----------------------------------------------------
+		// Connect to backend
+		// -----------------------------------------------------
 
 		backendConn, err := net.DialTimeout(
 			"tcp",
@@ -138,46 +211,79 @@ acceptLoop:
 		)
 
 		if err != nil {
-			fmt.Println("Backend connection failed:", backend)
+			logger.Error(
+				"failed to connect to backend",
+				"connection_id", connectionID,
+				"backend", backend,
+				"error", err,
+			)
 
 			markBackend(backend, false)
 
 			clientConn.Close()
+			activeProxies.Add(-1)
 
 			continue
 		}
 
-		// Track both ends of this proxy connection.
+		logger.Info(
+			"backend connected",
+			"connection_id", connectionID,
+			"backend", backend,
+		)
+
+		// Track sockets so shutdown can close them.
 		addConnection(clientConn)
 		addConnection(backendConn)
 
 		proxyWG.Add(1)
 
-		go func() {
+		go func(
+			id uint64,
+			client net.Conn,
+			backendConn net.Conn,
+		) {
 			defer proxyWG.Done()
 
-			proxy(clientConn, backendConn)
+			proxy(
+				id,
+				client,
+				backendConn,
+			)
 
-			removeConnection(clientConn)
+			removeConnection(client)
 			removeConnection(backendConn)
-		}()
+
+			activeProxies.Add(-1)
+
+			logger.Info(
+				"proxy finished",
+				"connection_id", id,
+				"active_connections", activeProxies.Load(),
+			)
+
+		}(
+			connectionID,
+			clientConn,
+			backendConn,
+		)
 	}
 
 	// ---------------------------------------------------------
-	// Begin shutdown
+	// Shutdown
 	// ---------------------------------------------------------
 
-	fmt.Println("Shutdown signal received")
+	logger.Info("shutdown signal received")
 
-	// Stop accepting new clients.
 	listener.Close()
 
-	// Stop the health checker.
 	stop()
 
-	fmt.Println("Waiting for active proxy connections...")
+	logger.Info(
+		"waiting for active connections",
+		"active_connections", activeProxies.Load(),
+	)
 
-	// Give existing connections time to finish.
 	done := make(chan struct{})
 
 	go func() {
@@ -187,27 +293,35 @@ acceptLoop:
 
 	select {
 	case <-done:
-		fmt.Println("All proxy connections finished")
+		logger.Info("all proxy connections finished")
 
 	case <-time.After(5 * time.Second):
-		fmt.Println("Grace period expired")
-		fmt.Println("Closing active connections")
+		logger.Warn(
+			"shutdown timeout reached",
+			"active_connections", activeProxies.Load(),
+		)
 
 		closeActiveConnections()
 
 		proxyWG.Wait()
 	}
 
-	// Make sure health checker has stopped.
 	healthWG.Wait()
 
-	fmt.Println("Load balancer stopped")
+	logger.Info(
+		"load balancer stopped",
+		"total_connections", totalConnections.Load(),
+	)
 }
 
 func parseBackends(value string) []Backend {
 	parts := strings.Split(value, ",")
 
-	result := make([]Backend, 0, len(parts))
+	result := make(
+		[]Backend,
+		0,
+		len(parts),
+	)
 
 	for _, part := range parts {
 		address := strings.TrimSpace(part)
@@ -216,10 +330,13 @@ func parseBackends(value string) []Backend {
 			continue
 		}
 
-		result = append(result, Backend{
-			Address: address,
-			Healthy: true,
-		})
+		result = append(
+			result,
+			Backend{
+				Address: address,
+				Healthy: true,
+			},
+		)
 	}
 
 	return result
@@ -233,7 +350,8 @@ func getNextHealthyBackend() (string, bool) {
 		index := (currentBackend + i) % len(backends)
 
 		if backends[index].Healthy {
-			currentBackend = (index + 1) % len(backends)
+			currentBackend =
+				(index + 1) % len(backends)
 
 			return backends[index].Address, true
 		}
@@ -251,6 +369,7 @@ func markBackend(address string, healthy bool) {
 			continue
 		}
 
+		// Nothing changed.
 		if backends[i].Healthy == healthy {
 			return
 		}
@@ -258,9 +377,15 @@ func markBackend(address string, healthy bool) {
 		backends[i].Healthy = healthy
 
 		if healthy {
-			fmt.Println("Backend recovered:", address)
+			logger.Info(
+				"backend recovered",
+				"backend", address,
+			)
 		} else {
-			fmt.Println("Backend marked unhealthy:", address)
+			logger.Warn(
+				"backend marked unhealthy",
+				"backend", address,
+			)
 		}
 
 		return
@@ -269,15 +394,21 @@ func markBackend(address string, healthy bool) {
 
 func healthChecker(ctx context.Context) {
 	ticker := time.NewTicker(2 * time.Second)
+
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("Health checker stopped")
+
+			logger.Info(
+				"health checker stopped",
+			)
+
 			return
 
 		case <-ticker.C:
+
 			checkAllBackends()
 		}
 	}
@@ -287,16 +418,24 @@ func checkAllBackends() {
 	// Copy addresses while holding the lock.
 	mu.Lock()
 
-	addresses := make([]string, 0, len(backends))
+	addresses := make(
+		[]string,
+		0,
+		len(backends),
+	)
 
 	for _, backend := range backends {
-		addresses = append(addresses, backend.Address)
+		addresses = append(
+			addresses,
+			backend.Address,
+		)
 	}
 
 	mu.Unlock()
 
-	// Network operations happen outside the lock.
+	// Network operations happen outside the mutex.
 	for _, address := range addresses {
+
 		conn, err := net.DialTimeout(
 			"tcp",
 			address,
@@ -314,15 +453,111 @@ func checkAllBackends() {
 	}
 }
 
-func proxy(client net.Conn, backend net.Conn) {
+func proxy(
+	id uint64,
+	client net.Conn,
+	backend net.Conn,
+) {
+	start := time.Now()
+
 	defer client.Close()
 	defer backend.Close()
 
-	// Client -> Backend
-	go io.Copy(backend, client)
+	results := make(
+		chan copyResult,
+		2,
+	)
 
+	// ---------------------------------------------------------
+	// Client -> Backend
+	// ---------------------------------------------------------
+
+	go func() {
+		n, err := io.Copy(
+			backend,
+			client,
+		)
+
+		results <- copyResult{
+			direction: "client_to_backend",
+			bytes:     n,
+			err:       err,
+		}
+	}()
+
+	// ---------------------------------------------------------
 	// Backend -> Client
-	io.Copy(client, backend)
+	// ---------------------------------------------------------
+
+	go func() {
+		n, err := io.Copy(
+			client,
+			backend,
+		)
+
+		results <- copyResult{
+			direction: "backend_to_client",
+			bytes:     n,
+			err:       err,
+		}
+	}()
+
+	// Wait for whichever direction finishes first.
+	first := <-results
+
+	// Closing both sockets causes the other io.Copy
+	// to stop as well.
+	client.Close()
+	backend.Close()
+
+	second := <-results
+
+	var clientToBackend int64
+	var backendToClient int64
+
+	var proxyError error
+
+	for _, result := range []copyResult{
+		first,
+		second,
+	} {
+		switch result.direction {
+
+		case "client_to_backend":
+			clientToBackend = result.bytes
+
+		case "backend_to_client":
+			backendToClient = result.bytes
+		}
+
+		if result.err != nil &&
+			result.err != io.EOF {
+			proxyError = result.err
+		}
+	}
+
+	duration := time.Since(start)
+
+	if proxyError != nil {
+		logger.Warn(
+			"proxy ended with error",
+			"connection_id", id,
+			"duration", duration,
+			"client_to_backend_bytes", clientToBackend,
+			"backend_to_client_bytes", backendToClient,
+			"error", proxyError,
+		)
+
+		return
+	}
+
+	logger.Info(
+		"connection closed",
+		"connection_id", id,
+		"duration", duration,
+		"client_to_backend_bytes", clientToBackend,
+		"backend_to_client_bytes", backendToClient,
+	)
 }
 
 func addConnection(conn net.Conn) {
@@ -348,6 +583,5 @@ func closeActiveConnections() {
 	}
 }
 
-func osInterrupt() os.Signal {
-	return syscall.SIGINT
-}
+// WaitGroup tracks active proxy workers.
+var proxyWG sync.WaitGroup
