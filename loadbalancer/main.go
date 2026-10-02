@@ -4,15 +4,26 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
+	"time"
 )
 
-var backends = []string{
-	"localhost:9001",
-	"localhost:9002",
-	"localhost:9003",
+type Backend struct {
+	Address string
+	Healthy bool
 }
 
-var currentBackend = 0
+var (
+	backends = []Backend{
+		{Address: "localhost:9001", Healthy: true},
+		{Address: "localhost:9002", Healthy: true},
+		{Address: "localhost:9003", Healthy: true},
+	}
+
+	currentBackend = 0
+
+	mu sync.Mutex
+)
 
 func main() {
 	listener, err := net.Listen("tcp", ":8080")
@@ -24,6 +35,8 @@ func main() {
 
 	fmt.Println("Load balancer listening on port 8080")
 
+	go healthChecker()
+
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
@@ -31,27 +44,97 @@ func main() {
 			continue
 		}
 
-		backend := getNextBackend()
+		backend, ok := getNextHealthyBackend()
 
-		fmt.Println("Routing client to:", backend)
-
-		backendConn, err := net.Dial("tcp", backend)
-		if err != nil {
-			fmt.Println("Error connecting to backend:", err)
+		if !ok {
+			fmt.Println("No healthy backends available")
 			clientConn.Close()
 			continue
 		}
+
+		fmt.Println("Routing client to:", backend)
+
+		backendConn, err := net.DialTimeout(
+			"tcp",
+			backend,
+			2*time.Second,
+		)
+
+		if err != nil {
+			fmt.Println("Backend connection failed:", backend)
+
+			markBackend(backend, false)
+
+			clientConn.Close()
+			continue
+		}
+
+		fmt.Println("Connected to backend:", backend)
 
 		go proxy(clientConn, backendConn)
 	}
 }
 
-func getNextBackend() string {
-	backend := backends[currentBackend]
+func getNextHealthyBackend() (string, bool) {
+	mu.Lock()
+	defer mu.Unlock()
 
-	currentBackend = (currentBackend + 1) % len(backends)
+	for i := 0; i < len(backends); i++ {
+		index := (currentBackend + i) % len(backends)
 
-	return backend
+		if backends[index].Healthy {
+			currentBackend = (index + 1) % len(backends)
+
+			return backends[index].Address, true
+		}
+	}
+
+	return "", false
+}
+
+func markBackend(address string, healthy bool) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	for i := range backends {
+		if backends[i].Address == address {
+			if backends[i].Healthy != healthy {
+				backends[i].Healthy = healthy
+
+				if healthy {
+					fmt.Println("Backend recovered:", address)
+				} else {
+					fmt.Println("Backend marked unhealthy:", address)
+				}
+			}
+
+			return
+		}
+	}
+}
+
+func healthChecker() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		for _, backend := range backends {
+			conn, err := net.DialTimeout(
+				"tcp",
+				backend.Address,
+				1*time.Second,
+			)
+
+			if err != nil {
+				markBackend(backend.Address, false)
+				continue
+			}
+
+			conn.Close()
+
+			markBackend(backend.Address, true)
+		}
+	}
 }
 
 func proxy(client net.Conn, backend net.Conn) {
