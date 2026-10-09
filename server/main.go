@@ -1,9 +1,14 @@
+
 package main
 
 import (
+	"bufio"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"strings"
 )
 
 func main() {
@@ -29,26 +34,34 @@ func main() {
 			continue
 		}
 
-		fmt.Println("Client connected:", conn.RemoteAddr())
+		// Each accepted connection is handled independently.
+		go handleConnection(conn, port)
+	}
+}
 
-		buffer := make([]byte, 1024)
+func handleConnection(conn net.Conn, port string) {
+	defer conn.Close()
 
-		n, err := conn.Read(buffer)
-		if err != nil {
-			fmt.Println("Error reading:", err)
-			conn.Close()
-			continue
+	// This demo backend uses a newline as its message delimiter.
+	reader := bufio.NewReader(conn)
+	message, err := reader.ReadString('\n')
+	if err != nil {
+		// Health checks connect and close without sending a message.
+		if !errors.Is(err, io.EOF) {
+			fmt.Printf("Backend %s read error: %v\n", port, err)
 		}
+		return
+	}
 
-		fmt.Println("Backend", port, "received:", string(buffer[:n]))
+	fmt.Printf(
+		"Backend %s received: %s\n",
+		port,
+		strings.TrimSpace(message),
+	)
 
-		response := []byte("Hello from BACKEND " + port)
+	response := []byte("Hello from BACKEND " + port)
 
-		_, err = conn.Write(response)
-		if err != nil {
-			fmt.Println("Error writing:", err)
-		}
-
-		conn.Close()
+	if _, err := conn.Write(response); err != nil {
+		fmt.Printf("Backend %s write error: %v\n", port, err)
 	}
 }
