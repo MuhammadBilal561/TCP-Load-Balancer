@@ -1,8 +1,10 @@
+
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -15,8 +17,11 @@ import (
 )
 
 type Backend struct {
-	Address string
-	Healthy bool
+	Address              string
+	Healthy              bool
+	ConsecutiveFailures  int
+	ConsecutiveSuccesses int
+	ActiveConnections    int64
 }
 
 type copyResult struct {
@@ -29,13 +34,15 @@ var (
 	backends       []Backend
 	currentBackend int
 
-	// Protects backend state.
+	// Protects all backend state.
 	mu sync.Mutex
 
-	// Tracks active TCP connections.
+	// Protects active TCP connections.
 	connMu sync.Mutex
-
 	activeConnections = make(map[net.Conn]struct{})
+
+	// Tracks proxy goroutines.
+	proxyWG sync.WaitGroup
 
 	// Connection statistics.
 	nextConnectionID atomic.Uint64
@@ -67,7 +74,7 @@ func main() {
 	listenAddr := flag.String(
 		"listen",
 		":8080",
-		"address for the load balancer to listen on",
+		"address for the load balancer",
 	)
 
 	backendList := flag.String(
@@ -76,7 +83,62 @@ func main() {
 		"comma-separated backend addresses",
 	)
 
+	algorithm := flag.String(
+		"algorithm",
+		"round-robin",
+		"backend selection algorithm: round-robin or least-connections",
+	)
+
+	healthInterval := flag.Duration(
+		"health-interval",
+		2*time.Second,
+		"interval between health checks",
+	)
+
+	healthTimeout := flag.Duration(
+		"health-timeout",
+		time.Second,
+		"timeout for individual health checks",
+	)
+
+	failureThreshold := flag.Int(
+		"health-failure-threshold",
+		2,
+		"consecutive failures before marking a backend unhealthy",
+	)
+
+	successThreshold := flag.Int(
+		"health-success-threshold",
+		2,
+		"consecutive successes before recovering a backend",
+	)
+
+	shutdownTimeout := flag.Duration(
+		"shutdown-timeout",
+		5*time.Second,
+		"maximum graceful shutdown duration",
+	)
+
 	flag.Parse()
+
+	// ---------------------------------------------------------
+	// Validate configuration
+	// ---------------------------------------------------------
+
+	if *algorithm != "round-robin" &&
+		*algorithm != "least-connections" {
+		logger.Error("unsupported balancing algorithm", "algorithm", *algorithm)
+		return
+	}
+
+	if *healthInterval <= 0 ||
+		*healthTimeout <= 0 ||
+		*shutdownTimeout <= 0 ||
+		*failureThreshold < 1 ||
+		*successThreshold < 1 {
+		logger.Error("invalid configuration values")
+		return
+	}
 
 	backends = parseBackends(*backendList)
 
@@ -107,18 +169,13 @@ func main() {
 			"address", *listenAddr,
 			"error", err,
 		)
-
 		return
 	}
 
 	logger.Info(
 		"load balancer started",
 		"listen", *listenAddr,
-	)
-
-	logger.Info(
-		"backends configured",
-		"count", len(backends),
+		"algorithm", *algorithm,
 	)
 
 	for _, backend := range backends {
@@ -127,6 +184,12 @@ func main() {
 			"address", backend.Address,
 		)
 	}
+
+	// Closing the listener on cancellation unblocks Accept().
+	go func() {
+		<-ctx.Done()
+		_ = listener.Close()
+	}()
 
 	// ---------------------------------------------------------
 	// Health checker
@@ -139,7 +202,13 @@ func main() {
 	go func() {
 		defer healthWG.Done()
 
-		healthChecker(ctx)
+		healthChecker(
+			ctx,
+			*healthInterval,
+			*healthTimeout,
+			*failureThreshold,
+			*successThreshold,
+		)
 	}()
 
 	// ---------------------------------------------------------
@@ -155,15 +224,15 @@ acceptLoop:
 				break acceptLoop
 			}
 
-			logger.Error(
-				"failed to accept client",
-				"error", err,
-			)
-
+			logger.Error("failed to accept client", "error", err)
 			continue
 		}
 
-		// Give this connection a unique ID.
+		if ctx.Err() != nil {
+			_ = clientConn.Close()
+			break acceptLoop
+		}
+
 		connectionID := nextConnectionID.Add(1)
 
 		totalConnections.Add(1)
@@ -180,7 +249,7 @@ acceptLoop:
 		// Select backend
 		// -----------------------------------------------------
 
-		backend, ok := getNextHealthyBackend()
+		backend, ok := selectBackend(*algorithm)
 
 		if !ok {
 			logger.Error(
@@ -188,9 +257,8 @@ acceptLoop:
 				"connection_id", connectionID,
 			)
 
-			clientConn.Close()
+			_ = clientConn.Close()
 			activeProxies.Add(-1)
-
 			continue
 		}
 
@@ -198,32 +266,58 @@ acceptLoop:
 			"client routed",
 			"connection_id", connectionID,
 			"backend", backend,
+			"algorithm", *algorithm,
 		)
 
 		// -----------------------------------------------------
 		// Connect to backend
 		// -----------------------------------------------------
 
-		backendConn, err := net.DialTimeout(
+		dialer := net.Dialer{
+			Timeout: 2 * time.Second,
+		}
+
+		backendConn, err := dialer.DialContext(
+			ctx,
 			"tcp",
 			backend,
-			2*time.Second,
 		)
 
 		if err != nil {
+			releaseBackend(backend)
+
+			_ = clientConn.Close()
+			activeProxies.Add(-1)
+
+			if ctx.Err() != nil {
+				break acceptLoop
+			}
+
 			logger.Error(
-				"failed to connect to backend",
+				"backend connection failed",
 				"connection_id", connectionID,
 				"backend", backend,
 				"error", err,
 			)
 
-			markBackend(backend, false)
-
-			clientConn.Close()
-			activeProxies.Add(-1)
+			recordBackendHealth(
+				backend,
+				false,
+				*failureThreshold,
+				*successThreshold,
+			)
 
 			continue
+		}
+
+		if ctx.Err() != nil {
+			_ = clientConn.Close()
+			_ = backendConn.Close()
+
+			releaseBackend(backend)
+			activeProxies.Add(-1)
+
+			break acceptLoop
 		}
 
 		logger.Info(
@@ -232,7 +326,10 @@ acceptLoop:
 			"backend", backend,
 		)
 
-		// Track sockets so shutdown can close them.
+		// -----------------------------------------------------
+		// Track active connections
+		// -----------------------------------------------------
+
 		addConnection(clientConn)
 		addConnection(backendConn)
 
@@ -242,17 +339,16 @@ acceptLoop:
 			id uint64,
 			client net.Conn,
 			backendConn net.Conn,
+			backendAddress string,
 		) {
 			defer proxyWG.Done()
 
-			proxy(
-				id,
-				client,
-				backendConn,
-			)
+			proxy(id, client, backendConn)
 
 			removeConnection(client)
 			removeConnection(backendConn)
+
+			releaseBackend(backendAddress)
 
 			activeProxies.Add(-1)
 
@@ -266,18 +362,18 @@ acceptLoop:
 			connectionID,
 			clientConn,
 			backendConn,
+			backend,
 		)
 	}
 
 	// ---------------------------------------------------------
-	// Shutdown
+	// Graceful shutdown
 	// ---------------------------------------------------------
 
 	logger.Info("shutdown signal received")
 
-	listener.Close()
-
 	stop()
+	_ = listener.Close()
 
 	logger.Info(
 		"waiting for active connections",
@@ -295,14 +391,13 @@ acceptLoop:
 	case <-done:
 		logger.Info("all proxy connections finished")
 
-	case <-time.After(5 * time.Second):
+	case <-time.After(*shutdownTimeout):
 		logger.Warn(
 			"shutdown timeout reached",
 			"active_connections", activeProxies.Load(),
 		)
 
 		closeActiveConnections()
-
 		proxyWG.Wait()
 	}
 
@@ -314,144 +409,314 @@ acceptLoop:
 	)
 }
 
+// -------------------------------------------------------------
+// Parse backend configuration
+// -------------------------------------------------------------
+
 func parseBackends(value string) []Backend {
 	parts := strings.Split(value, ",")
 
-	result := make(
-		[]Backend,
-		0,
-		len(parts),
-	)
+	result := make([]Backend, 0, len(parts))
+	seen := make(map[string]bool)
 
 	for _, part := range parts {
 		address := strings.TrimSpace(part)
 
-		if address == "" {
+		if address == "" || seen[address] {
 			continue
 		}
 
-		result = append(
-			result,
-			Backend{
-				Address: address,
-				Healthy: true,
-			},
-		)
+		seen[address] = true
+
+		result = append(result, Backend{
+			Address: address,
+			Healthy: true,
+		})
 	}
 
 	return result
 }
 
-func getNextHealthyBackend() (string, bool) {
+// -------------------------------------------------------------
+// Backend selection
+// -------------------------------------------------------------
+
+func selectBackend(algorithm string) (string, bool) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	for i := 0; i < len(backends); i++ {
-		index := (currentBackend + i) % len(backends)
-
-		if backends[index].Healthy {
-			currentBackend =
-				(index + 1) % len(backends)
-
-			return backends[index].Address, true
-		}
+	if len(backends) == 0 {
+		return "", false
 	}
 
-	return "", false
+	selectedIndex := -1
+
+	switch algorithm {
+
+	case "round-robin":
+
+		for i := 0; i < len(backends); i++ {
+			index := (currentBackend + i) % len(backends)
+
+			if backends[index].Healthy {
+				selectedIndex = index
+				break
+			}
+		}
+
+	case "least-connections":
+
+		for i := 0; i < len(backends); i++ {
+			index := (currentBackend + i) % len(backends)
+
+			if !backends[index].Healthy {
+				continue
+			}
+
+			if selectedIndex == -1 ||
+				backends[index].ActiveConnections <
+					backends[selectedIndex].ActiveConnections {
+				selectedIndex = index
+			}
+		}
+
+	default:
+		return "", false
+	}
+
+	if selectedIndex == -1 {
+		return "", false
+	}
+
+	// Advance the starting point to rotate ties fairly.
+	currentBackend = (selectedIndex + 1) % len(backends)
+
+	// Reserve one active connection for this backend.
+	backends[selectedIndex].ActiveConnections++
+
+	return backends[selectedIndex].Address, true
 }
 
-func markBackend(address string, healthy bool) {
+// Maintains compatibility with the earlier Round Robin tests.
+func getNextHealthyBackend() (string, bool) {
+	return selectBackend("round-robin")
+}
+
+// -------------------------------------------------------------
+// Release backend connection reservation
+// -------------------------------------------------------------
+
+func releaseBackend(address string) {
 	mu.Lock()
 	defer mu.Unlock()
 
 	for i := range backends {
-		if backends[i].Address != address {
-			continue
-		}
+		if backends[i].Address == address {
+			if backends[i].ActiveConnections > 0 {
+				backends[i].ActiveConnections--
+			}
 
-		// Nothing changed.
-		if backends[i].Healthy == healthy {
 			return
 		}
-
-		backends[i].Healthy = healthy
-
-		if healthy {
-			logger.Info(
-				"backend recovered",
-				"backend", address,
-			)
-		} else {
-			logger.Warn(
-				"backend marked unhealthy",
-				"backend", address,
-			)
-		}
-
-		return
 	}
 }
 
-func healthChecker(ctx context.Context) {
-	ticker := time.NewTicker(2 * time.Second)
+// -------------------------------------------------------------
+// Backend health state
+// -------------------------------------------------------------
 
+func recordBackendHealth(
+	address string,
+	success bool,
+	failureThreshold int,
+	successThreshold int,
+) {
+	var transition string
+
+	mu.Lock()
+
+	for i := range backends {
+		backend := &backends[i]
+
+		if backend.Address != address {
+			continue
+		}
+
+		if success {
+			backend.ConsecutiveFailures = 0
+
+			if backend.Healthy {
+				backend.ConsecutiveSuccesses = 0
+			} else {
+				backend.ConsecutiveSuccesses++
+
+				if backend.ConsecutiveSuccesses >= successThreshold {
+					backend.Healthy = true
+					transition = "recovered"
+
+					backend.ConsecutiveSuccesses = 0
+					backend.ConsecutiveFailures = 0
+				}
+			}
+		} else {
+			backend.ConsecutiveSuccesses = 0
+
+			if !backend.Healthy {
+				backend.ConsecutiveFailures = 0
+			} else {
+				backend.ConsecutiveFailures++
+
+				if backend.ConsecutiveFailures >= failureThreshold {
+					backend.Healthy = false
+					transition = "unhealthy"
+
+					backend.ConsecutiveFailures = 0
+					backend.ConsecutiveSuccesses = 0
+				}
+			}
+		}
+
+		break
+	}
+
+	mu.Unlock()
+
+	if transition == "recovered" {
+		logger.Info("backend recovered", "backend", address)
+	} else if transition == "unhealthy" {
+		logger.Warn("backend marked unhealthy", "backend", address)
+	}
+}
+
+// Retained for compatibility with earlier unit tests.
+// Production health decisions use recordBackendHealth().
+func markBackend(address string, healthy bool) {
+	var changed bool
+
+	mu.Lock()
+
+	for i := range backends {
+		if backends[i].Address == address {
+			changed = backends[i].Healthy != healthy
+
+			backends[i].Healthy = healthy
+			backends[i].ConsecutiveFailures = 0
+			backends[i].ConsecutiveSuccesses = 0
+
+			break
+		}
+	}
+
+	mu.Unlock()
+
+	if changed && logger != nil {
+		if healthy {
+			logger.Info("backend recovered", "backend", address)
+		} else {
+			logger.Warn("backend marked unhealthy", "backend", address)
+		}
+	}
+}
+
+// -------------------------------------------------------------
+// Health checker
+// -------------------------------------------------------------
+
+func healthChecker(
+	ctx context.Context,
+	interval time.Duration,
+	timeout time.Duration,
+	failureThreshold int,
+	successThreshold int,
+) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-
-			logger.Info(
-				"health checker stopped",
-			)
-
+			logger.Info("health checker stopped")
 			return
 
 		case <-ticker.C:
-
-			checkAllBackends()
+			checkAllBackends(
+				ctx,
+				timeout,
+				failureThreshold,
+				successThreshold,
+			)
 		}
 	}
 }
 
-func checkAllBackends() {
-	// Copy addresses while holding the lock.
+func checkAllBackends(
+	ctx context.Context,
+	timeout time.Duration,
+	failureThreshold int,
+	successThreshold int,
+) {
 	mu.Lock()
 
-	addresses := make(
-		[]string,
-		0,
-		len(backends),
-	)
+	addresses := make([]string, 0, len(backends))
 
 	for _, backend := range backends {
-		addresses = append(
-			addresses,
-			backend.Address,
-		)
+		addresses = append(addresses, backend.Address)
 	}
 
 	mu.Unlock()
 
-	// Network operations happen outside the mutex.
+	var wg sync.WaitGroup
+
+	// Check backends concurrently.
 	for _, address := range addresses {
+		wg.Add(1)
 
-		conn, err := net.DialTimeout(
-			"tcp",
-			address,
-			1*time.Second,
-		)
+		go func(address string) {
+			defer wg.Done()
 
-		if err != nil {
-			markBackend(address, false)
-			continue
-		}
+			checkCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
 
-		conn.Close()
+			dialer := net.Dialer{}
 
-		markBackend(address, true)
+			conn, err := dialer.DialContext(
+				checkCtx,
+				"tcp",
+				address,
+			)
+
+			if err != nil {
+				// Avoid marking everything unhealthy during shutdown.
+				if ctx.Err() == nil {
+					recordBackendHealth(
+						address,
+						false,
+						failureThreshold,
+						successThreshold,
+					)
+				}
+
+				return
+			}
+
+			_ = conn.Close()
+
+			recordBackendHealth(
+				address,
+				true,
+				failureThreshold,
+				successThreshold,
+			)
+
+		}(address)
 	}
+
+	wg.Wait()
 }
+
+// -------------------------------------------------------------
+// TCP bidirectional proxy with half-close support
+// -------------------------------------------------------------
 
 func proxy(
 	id uint64,
@@ -463,20 +728,15 @@ func proxy(
 	defer client.Close()
 	defer backend.Close()
 
-	results := make(
-		chan copyResult,
-		2,
-	)
+	results := make(chan copyResult, 2)
 
-	// ---------------------------------------------------------
 	// Client -> Backend
-	// ---------------------------------------------------------
-
 	go func() {
-		n, err := io.Copy(
-			backend,
-			client,
-		)
+		n, err := io.Copy(backend, client)
+
+		if err == nil {
+			err = closeWrite(backend)
+		}
 
 		results <- copyResult{
 			direction: "client_to_backend",
@@ -485,15 +745,13 @@ func proxy(
 		}
 	}()
 
-	// ---------------------------------------------------------
 	// Backend -> Client
-	// ---------------------------------------------------------
-
 	go func() {
-		n, err := io.Copy(
-			client,
-			backend,
-		)
+		n, err := io.Copy(client, backend)
+
+		if err == nil {
+			err = closeWrite(client)
+		}
 
 		results <- copyResult{
 			direction: "backend_to_client",
@@ -502,27 +760,23 @@ func proxy(
 		}
 	}()
 
-	// Wait for whichever direction finishes first.
+	// Wait for the first direction to finish.
 	first := <-results
 
-	// Closing both sockets causes the other io.Copy
-	// to stop as well.
-	client.Close()
-	backend.Close()
+	if first.err != nil {
+		_ = client.Close()
+		_ = backend.Close()
+	}
 
+	// Wait for the second direction.
 	second := <-results
 
 	var clientToBackend int64
 	var backendToClient int64
-
 	var proxyError error
 
-	for _, result := range []copyResult{
-		first,
-		second,
-	} {
+	for _, result := range []copyResult{first, second} {
 		switch result.direction {
-
 		case "client_to_backend":
 			clientToBackend = result.bytes
 
@@ -530,8 +784,7 @@ func proxy(
 			backendToClient = result.bytes
 		}
 
-		if result.err != nil &&
-			result.err != io.EOF {
+		if result.err != nil && proxyError == nil {
 			proxyError = result.err
 		}
 	}
@@ -560,6 +813,24 @@ func proxy(
 	)
 }
 
+// TCP half-close: finish sending without closing receiving.
+func closeWrite(conn net.Conn) error {
+	tcpConn, ok := conn.(*net.TCPConn)
+
+	if !ok {
+		return fmt.Errorf(
+			"TCP half-close unsupported for connection type %T",
+			conn,
+		)
+	}
+
+	return tcpConn.CloseWrite()
+}
+
+// -------------------------------------------------------------
+// Active connection tracking
+// -------------------------------------------------------------
+
 func addConnection(conn net.Conn) {
 	connMu.Lock()
 	defer connMu.Unlock()
@@ -576,12 +847,16 @@ func removeConnection(conn net.Conn) {
 
 func closeActiveConnections() {
 	connMu.Lock()
-	defer connMu.Unlock()
+
+	connections := make([]net.Conn, 0, len(activeConnections))
 
 	for conn := range activeConnections {
-		conn.Close()
+		connections = append(connections, conn)
+	}
+
+	connMu.Unlock()
+
+	for _, conn := range connections {
+		_ = conn.Close()
 	}
 }
-
-// WaitGroup tracks active proxy workers.
-var proxyWG sync.WaitGroup
