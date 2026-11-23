@@ -1,0 +1,108 @@
+
+services:
+
+  loadbalancer:
+    build:
+      context: .
+      dockerfile: Dockerfile.loadbalancer
+
+    command:
+      - "-listen=:8080"
+      - "-metrics=:9090"
+      - "-backends=backend1:9001,backend2:9002,backend3:9003"
+      - "-algorithm=least-connections"
+      - "-health-interval=2s"
+      - "-health-timeout=1s"
+      - "-health-failure-threshold=2"
+      - "-health-success-threshold=2"
+      - "-shutdown-timeout=10s"
+
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+
+    depends_on:
+      backend1:
+        condition: service_started
+      backend2:
+        condition: service_started
+      backend3:
+        condition: service_started
+
+    restart: unless-stopped
+    stop_grace_period: 15s
+    init: true
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    networks:
+      - tcp-network
+
+
+  backend1:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+
+    command: ["9001"]
+
+    restart: unless-stopped
+    init: true
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    networks:
+      - tcp-network
+
+
+  backend2:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+
+    command: ["9002"]
+
+    restart: unless-stopped
+    init: true
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    networks:
+      - tcp-network
+
+
+  backend3:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+
+    command: ["9003"]
+
+    restart: unless-stopped
+    init: true
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    networks:
+      - tcp-network
+
+
+networks:
+  tcp-network:
+    driver: bridge

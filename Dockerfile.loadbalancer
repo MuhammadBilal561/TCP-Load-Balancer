@@ -1,0 +1,26 @@
+
+# Build stage
+FROM golang:1.27.1-alpine AS builder
+
+WORKDIR /src
+
+COPY go.mod ./
+COPY loadbalancer/ ./loadbalancer/
+
+RUN CGO_ENABLED=0 go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/loadbalancer \
+    ./loadbalancer
+
+# Minimal runtime stage
+FROM gcr.io/distroless/static-debian12:nonroot
+
+WORKDIR /
+
+COPY --from=builder /out/loadbalancer /loadbalancer
+
+EXPOSE 8080/tcp
+EXPOSE 9090/tcp
+
+ENTRYPOINT ["/loadbalancer"]

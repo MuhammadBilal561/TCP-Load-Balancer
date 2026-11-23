@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strings"
+	"sync"
 )
 
 func main() {
@@ -20,48 +22,65 @@ func main() {
 
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		fmt.Println("Error starting backend:", err)
-		return
+		log.Fatalf("failed to start backend on port %s: %v", port, err)
 	}
+
 	defer listener.Close()
 
-	fmt.Println("Backend server listening on port", port)
+	log.Printf("backend listening on port %s", port)
+
+	var workers sync.WaitGroup
+
+	defer workers.Wait()
 
 	for {
 		conn, err := listener.Accept()
+
 		if err != nil {
-			fmt.Println("Error accepting connection:", err)
+			log.Printf("accept error on port %s: %v", port, err)
 			continue
 		}
 
-		// Each accepted connection is handled independently.
-		go handleConnection(conn, port)
+		workers.Add(1)
+
+		go func(conn net.Conn) {
+			defer workers.Done()
+			handleConnection(conn, port)
+		}(conn)
 	}
 }
 
 func handleConnection(conn net.Conn, port string) {
 	defer conn.Close()
 
-	// This demo backend uses a newline as its message delimiter.
 	reader := bufio.NewReader(conn)
+
 	message, err := reader.ReadString('\n')
+
 	if err != nil {
-		// Health checks connect and close without sending a message.
+		// Health checks connect and immediately close.
 		if !errors.Is(err, io.EOF) {
-			fmt.Printf("Backend %s read error: %v\n", port, err)
+			log.Printf("read error on backend %s: %v", port, err)
 		}
 		return
 	}
 
-	fmt.Printf(
-		"Backend %s received: %s\n",
+	message = strings.TrimSpace(message)
+
+	log.Printf(
+		"backend=%s received=%q remote=%s",
 		port,
-		strings.TrimSpace(message),
+		message,
+		conn.RemoteAddr(),
 	)
 
-	response := []byte("Hello from BACKEND " + port)
+	response := fmt.Sprintf(
+		"Hello from BACKEND %s",
+		port,
+	)
 
-	if _, err := conn.Write(response); err != nil {
-		fmt.Printf("Backend %s write error: %v\n", port, err)
+	if _, err := io.WriteString(conn, response); err != nil {
+		log.Printf("write error on backend %s: %v", port, err)
+		return
 	}
 }
