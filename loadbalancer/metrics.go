@@ -1,0 +1,309 @@
+
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// -------------------------------------------------------------
+// Metrics HTTP router
+// -------------------------------------------------------------
+
+func newMetricsHandler() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/metrics", serveMetrics)
+
+	return mux
+}
+
+// -------------------------------------------------------------
+// Prometheus-compatible metrics endpoint
+// -------------------------------------------------------------
+
+func serveMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(
+			w,
+			"method not allowed",
+			http.StatusMethodNotAllowed,
+		)
+		return
+	}
+
+	w.Header().Set(
+		"Content-Type",
+		"text/plain; version=0.0.4; charset=utf-8",
+	)
+
+	// ---------------------------------------------------------
+	// Take a consistent snapshot of backend state.
+	// ---------------------------------------------------------
+
+	mu.Lock()
+
+	type backendSnapshot struct {
+		address           string
+		healthy           bool
+		activeConnections int64
+		failures          int
+		successes         int
+	}
+
+	snapshots := make(
+		[]backendSnapshot,
+		0,
+		len(backends),
+	)
+
+	for _, backend := range backends {
+		snapshots = append(
+			snapshots,
+			backendSnapshot{
+				address:           backend.Address,
+				healthy:           backend.Healthy,
+				activeConnections: backend.ActiveConnections,
+				failures:          backend.ConsecutiveFailures,
+				successes:         backend.ConsecutiveSuccesses,
+			},
+		)
+	}
+
+	mu.Unlock()
+
+	// ---------------------------------------------------------
+	// Process uptime
+	// ---------------------------------------------------------
+
+	uptime := time.Since(processStartedAt).Seconds()
+
+	if uptime < 0 {
+		uptime = 0
+	}
+
+	// ---------------------------------------------------------
+	// Global metrics
+	// ---------------------------------------------------------
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_uptime_seconds Time since the load balancer started.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_uptime_seconds gauge",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_uptime_seconds %.2f\n",
+		uptime,
+	)
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_connections_accepted_total Total accepted client connections.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_connections_accepted_total counter",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_connections_accepted_total %d\n",
+		totalConnections.Load(),
+	)
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_connections_active Current active proxy connections.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_connections_active gauge",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_connections_active %d\n",
+		activeProxies.Load(),
+	)
+
+	// ---------------------------------------------------------
+	// Backend connection metrics
+	// ---------------------------------------------------------
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_backend_connections_successful_total Successful backend TCP connection attempts.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_backend_connections_successful_total counter",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_backend_connections_successful_total %d\n",
+		backendDialSuccesses.Load(),
+	)
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_backend_connections_failed_total Failed backend TCP connection attempts.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_backend_connections_failed_total counter",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_backend_connections_failed_total %d\n",
+		backendDialFailures.Load(),
+	)
+
+	// ---------------------------------------------------------
+	// Traffic metrics
+	// ---------------------------------------------------------
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_bytes_client_to_backend_total Total bytes forwarded from clients to backends.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_bytes_client_to_backend_total counter",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_bytes_client_to_backend_total %d\n",
+		bytesClientToBackend.Load(),
+	)
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_bytes_backend_to_client_total Total bytes forwarded from backends to clients.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_bytes_backend_to_client_total counter",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_bytes_backend_to_client_total %d\n",
+		bytesBackendToClient.Load(),
+	)
+
+	// ---------------------------------------------------------
+	// Proxy error metrics
+	// ---------------------------------------------------------
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_proxy_errors_total Total proxy connections that ended with an I/O error.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_proxy_errors_total counter",
+	)
+	fmt.Fprintf(
+		w,
+		"loadbalancer_proxy_errors_total %d\n",
+		proxyErrors.Load(),
+	)
+
+	// ---------------------------------------------------------
+	// Per-backend metrics
+	// ---------------------------------------------------------
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_backend_healthy Whether a backend is healthy (1) or unhealthy (0).",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_backend_healthy gauge",
+	)
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_backend_active_connections Current connections assigned to a backend.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_backend_active_connections gauge",
+	)
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_backend_consecutive_failures Current consecutive health check failures.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_backend_consecutive_failures gauge",
+	)
+
+	fmt.Fprintln(
+		w,
+		"# HELP loadbalancer_backend_consecutive_successes Current consecutive health check successes.",
+	)
+	fmt.Fprintln(
+		w,
+		"# TYPE loadbalancer_backend_consecutive_successes gauge",
+	)
+
+	for _, backend := range snapshots {
+		labels := fmt.Sprintf(
+			`backend="%s"`,
+			escapeMetricLabel(backend.address),
+		)
+
+		healthy := 0
+		if backend.healthy {
+			healthy = 1
+		}
+
+		fmt.Fprintf(
+			w,
+			"loadbalancer_backend_healthy{%s} %d\n",
+			labels,
+			healthy,
+		)
+
+		fmt.Fprintf(
+			w,
+			"loadbalancer_backend_active_connections{%s} %d\n",
+			labels,
+			backend.activeConnections,
+		)
+
+		fmt.Fprintf(
+			w,
+			"loadbalancer_backend_consecutive_failures{%s} %d\n",
+			labels,
+			backend.failures,
+		)
+
+		fmt.Fprintf(
+			w,
+			"loadbalancer_backend_consecutive_successes{%s} %d\n",
+			labels,
+			backend.successes,
+		)
+	}
+}
+
+// -------------------------------------------------------------
+// Escape Prometheus label values
+// -------------------------------------------------------------
+
+func escapeMetricLabel(value string) string {
+	replacer := strings.NewReplacer(
+		"\\", "\\\\",
+		"\n", "\\n",
+		"\"", "\\\"",
+	)
+
+	return replacer.Replace(value)
+}
