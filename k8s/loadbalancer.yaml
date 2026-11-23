@@ -1,0 +1,100 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tcp-load-balancer
+  namespace: tcp-lb
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tcp-load-balancer
+  template:
+    metadata:
+      labels:
+        app: tcp-load-balancer
+    spec:
+      terminationGracePeriodSeconds: 20
+
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: loadbalancer
+          image: tcp-load-balancer:1.0
+          imagePullPolicy: IfNotPresent
+
+          envFrom:
+            - configMapRef:
+                name: tcp-lb-config
+
+          args:
+            - "-health-interval=2s"
+            - "-health-timeout=1s"
+            - "-health-failure-threshold=2"
+            - "-health-success-threshold=2"
+            - "-shutdown-timeout=10s"
+
+          ports:
+            - name: tcp
+              containerPort: 8080
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            periodSeconds: 2
+            failureThreshold: 15
+
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: metrics
+            periodSeconds: 10
+            timeoutSeconds: 2
+
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            periodSeconds: 5
+            timeoutSeconds: 2
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 1000m
+              memory: 256Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tcp-load-balancer
+  namespace: tcp-lb
+spec:
+  type: ClusterIP
+  selector:
+    app: tcp-load-balancer
+  ports:
+    - name: tcp
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+      protocol: TCP

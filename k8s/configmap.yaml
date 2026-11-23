@@ -1,0 +1,11 @@
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tcp-lb-config
+  namespace: tcp-lb
+data:
+  LB_LISTEN: ":8080"
+  LB_METRICS_LISTEN: ":9090"
+  LB_BACKENDS: "backend1:9001,backend2:9002,backend3:9003"
+  LB_ALGORITHM: "least-connections"
